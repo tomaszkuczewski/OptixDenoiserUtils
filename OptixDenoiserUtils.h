@@ -1,14 +1,18 @@
 //Optix 7.0.0 Denoiser Implementation
 //Tomasz Kuczewski, 2019
 
+#ifndef OPTIX_DENOISER_UTILS
+#define OPTIX_DENOISER_UTILS
+
 #ifdef _MSC_VER
 #pragma comment(lib, "cudart_static.lib")
-#define _CRT_SECURE_NO_WARNINGS //Causing errors in optix stubs
+#define _CRT_SECURE_NO_WARNINGS
 #endif
 
 #include <iomanip>
 #include <string>
 #include <sstream>
+#include <algorithm>
 #include <functional>
 #include <iostream>
 #include <fstream>
@@ -16,10 +20,10 @@
 
 #include <cuda_runtime.h>
 #include <optix.h>
-#include <optix_function_table_definition.h>
 #include <optix_stubs.h>
 
 #include <lodepng.h>
+#include <tinyexr.h>
 
 #define OPTIX_CHECK( call )                                                    \
     do                                                                         \
@@ -52,8 +56,8 @@
 using byte = unsigned char;
 using uint = unsigned int;
 
-using decode_function = std::function<void(std::vector<byte>&, std::vector<byte>&, unsigned int&, unsigned int&)>;
-using encode_function = std::function<void(std::vector<byte>&, std::vector<byte>&, const unsigned int&, const unsigned int&)>;
+using decode_function = std::function<void(const std::vector<byte>&, std::vector<float>&, unsigned int&, unsigned int&)>;
+using encode_function = std::function<void(const std::vector<float>&, std::vector<byte>&, const unsigned int&, const unsigned int&)>;
 
 namespace sutil
 {
@@ -78,18 +82,55 @@ namespace sutil
 	};
 }
 
-static inline void LodePngWrapperDecoder(std::vector<byte>& input, std::vector<byte>& output, unsigned int& width, unsigned int& height)
+static inline void LodePngWrapperDecoder(const std::vector<byte>& input, std::vector<float>& output, unsigned int& width, unsigned int& height)
 {
+	std::vector<byte> rawOutput{};
 	auto lodeState = lodepng::State{};
-	if (lodepng::decode(output, width, height, lodeState, input))
+	if (lodepng::decode(rawOutput, width, height, lodeState, input))
+		throw std::exception("Could not load this file with LodePNG");
+
+	output.resize(rawOutput.size());
+	for (uint i = 0; i < rawOutput.size(); ++i)
+	*(((float*)output.data()) + i) = *(rawOutput.data() + i) / 255.0f;  //To minimize access times
+}
+
+static inline void LodePngWrapperEncoder(const std::vector<float>& input, std::vector<byte>& output, const unsigned int& width, const unsigned int& height)
+{
+	std::vector<byte> rawData{};
+	rawData.resize(input.size());
+	for (uint i = 0; i < input.size(); ++i)
+	{
+		//To minimize access times
+		float bytePixel = *(((float*)input.data()) + i) * 255.0f;
+		*(rawData.data() + i) = (unsigned char)(bytePixel > 255.0f ? 255.0f : bytePixel);
+	}
+
+	auto lodeState = lodepng::State{};
+	if (lodepng::encode(output, rawData, width, height))
 		throw std::exception("Could not load this file with LodePNG");
 }
 
-static inline void LodePngWrapperEncoder(std::vector<byte>& input, std::vector<byte>& output, const unsigned int& width, const unsigned int& height)
+static inline void ExrWrapperDecoder(const std::vector<byte>& input, std::vector<float>& output, unsigned int& width, unsigned int& height)
 {
-	auto lodeState = lodepng::State{};
-	if (lodepng::encode(output, input, width, height))
-		throw std::exception("Could not load this file with LodePNG");
+	float* dataVector;
+	const char* error;
+	if (LoadEXRFromMemory(&dataVector, reinterpret_cast<int*>(&width), reinterpret_cast<int*>(&height), input.data(), input.size(), &error))
+		throw std::exception("Could not load this file with TinyEXR");
+
+	uint imageLength = width * height * 4;
+	output.resize(imageLength);
+	memcpy((void*)output.data(), (void*)dataVector, imageLength);
+
+	//uint imageLength = width * height * 4;
+	//auto maxPixelValue = std::max_element(dataVector, dataVector + imageLength);
+	//output.resize(imageLength);
+	//for (uint i = 0; i < imageLength; i+=4)
+	//{
+	//	output[i] = dataVector[i] / *maxPixelValue;
+	//	output[i+1] = dataVector[i+1] / *maxPixelValue;
+	//	output[i+2] = dataVector[i+2] / *maxPixelValue;
+	//	output[i + 3] = dataVector[i + 3];
+	//}
 }
 
 enum class OptixImageType
@@ -163,8 +204,10 @@ public:
 inline decode_function OptixDenoiserUtils::GetDecoder(std::string fileName) const
 {
 	auto extention = fileName.substr(fileName.find_first_of('.') + 1);
-	if (_stricmp(extention.c_str(), ".png"))
+	if (_stricmp(extention.c_str(), "png") == 0)
 		return LodePngWrapperDecoder;	
+	else if(_stricmp(extention.c_str(), "exr") == 0)
+		return ExrWrapperDecoder;
 
 	return 0;
 }
@@ -209,7 +252,6 @@ inline void OptixDenoiserUtils::GenerateOptixOutputBuffer(size_t size, OptixImag
 inline void OptixDenoiserUtils::ReadImage(std::string fileName, std::vector<float>& imageData, uint& width, uint& height) const
 {
 	auto formatData = std::vector<byte>{};
-	auto rawData = std::vector<byte>{};
 
 	std::ifstream stream{ fileName, std::ios::binary };
 	if (!stream.is_open())
@@ -232,32 +274,23 @@ inline void OptixDenoiserUtils::ReadImage(std::string fileName, std::vector<floa
 	if (!decoder) throw std::exception("Could not find decoder for source image");
 
 	//Read the raw image
-	decoder(formatData, rawData, width, height);
+	decoder(formatData, imageData, width, height);
 
-	//Resize image data
-	imageData.resize(rawData.size());
+	////Resize image data
+	//imageData.resize(rawData.size());
 
-	//Recalculate float buffer
-	for (uint i = 0; i < rawData.size(); ++i)
-		*(((float*)imageData.data()) + i) = *(rawData.data() + i) / 255.0f;  //To minimize access times
+	////Recalculate float buffer
+	//for (uint i = 0; i < rawData.size(); ++i)
+	//	*(((float*)imageData.data()) + i) = *(rawData.data() + i) / 255.0f;  //To minimize access times
 }
 
 inline void OptixDenoiserUtils::SaveImage(std::string fileName) const
 {
-	auto rawData = std::vector<byte>{};
 	auto formatData = std::vector<byte>{};
 	auto encoder = GetEncoder(fileName);
 	if (!encoder) throw std::exception("Could not find encoder for destination image");
 
-	rawData.resize(_mFBufferDenoised.size());
-	for (uint i = 0; i < _mFBufferDenoised.size(); ++i)
-	{
-		//To minimize access times
-		float bytePixel = *(((float*)_mFBufferDenoised.data()) + i) * 255.0f;
-		*(rawData.data() + i) = (unsigned char)(bytePixel > 255.0f ? 255.0f : bytePixel);
-	}
-
-	encoder(rawData, formatData, _mWidth, _mHeight);
+	encoder(_mFBufferDenoised, formatData, _mWidth, _mHeight);
 
 	std::ofstream stream{ fileName.c_str(), std::ios::binary };
 	if (!stream.is_open())
@@ -366,7 +399,7 @@ inline void OptixDenoiserUtils::Denoise(float blendFactor, unsigned int denoiseA
 	}
 
 	OptixImage2D* images[3] = { &bufferRBG , &bufferAlbedo , &bufferNormal };
-	OPTIX_CHECK(optixDenoiserInvoke(_mODenoiser, _mCStream, &denoiserParams, _mCDenoiserState, _mOSizes.stateSizeInBytes, images[0], bufferCount, 0, 0,
+	OPTIX_CHECK(optixDenoiserInvoke(_mODenoiser, _mCStream, &denoiserParams, _mCDenoiserState, _mOSizes.stateSizeInBytes, *images, bufferCount, 0, 0,
 				&bufferOutput, _mCScratch, _mOSizes.recommendedScratchSizeInBytes));
 
 	//Copy GPU result to CPU
@@ -403,3 +436,4 @@ inline void OptixDenoiserUtils::SetNormal(const char* fileName)
 	if (_mWidth != width || height != _mHeight) throw std::exception("Normal image size is not the same as RGB one");
 }
 
+#endif
