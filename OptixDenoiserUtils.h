@@ -225,8 +225,8 @@ inline void OptixDenoiserUtils::GenerateOptixInputBuffer(const std::vector<float
 {
 	//Preallocate buffer in GPU
 	CUdeviceptr gpuImage{};
-	CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&gpuImage), _mFBufferRBG.size() * sizeof(float)));
-	CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(gpuImage), (const void*)_mFBufferRBG.data(), _mFBufferRBG.size() * sizeof(float), cudaMemcpyHostToDevice));
+	CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&gpuImage), buffer.size() * sizeof(float)));
+	CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(gpuImage), (const void*)buffer.data(), buffer.size() * sizeof(float), cudaMemcpyHostToDevice));
 	
 	output.data = gpuImage;
 	output.format = OptixPixelFormat::OPTIX_PIXEL_FORMAT_FLOAT4;
